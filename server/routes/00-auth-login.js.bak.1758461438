@@ -1,0 +1,132 @@
+module.exports = function(app, db){
+  const express = require('express')
+  const crypto  = require('crypto')
+  let bcrypt = null; try{ bcrypt = require('bcryptjs') }catch{}
+
+  const ADMIN_USER = process.env.ADMIN_USER || 'admin'
+  const ADMIN_PASS = process.env.ADMIN_PASS || 'Admin123' // absichtlich ohne '!' wegen Bash-History
+
+  // Body-Parser (falls global nicht gesetzt)
+  app.use?.(express.json({limit:'200kb'}))
+  app.use?.(express.urlencoded({extended:true}))
+
+  function mkToken(){ return crypto.randomBytes(24).toString('hex') }
+
+  function pickCredentials(req){
+    const b = req.body || {}
+    const h = req.headers || {}
+    let u = b.username || b.user || b.email || b.login
+    let p = b.password
+
+    // Basic-Auth
+    const auth = h['authorization'] || ''
+    if ((!u || !p) && auth.startsWith('Basic ')){
+      try{
+        const dec = Buffer.from(auth.split(' ')[1], 'base64').toString('utf8')
+        const i = dec.indexOf(':'); if (i>0){ u = u || dec.slice(0,i); p = p || dec.slice(i+1) }
+      }catch{}
+    }
+
+    // GET-Fallback (für Debug)
+    if ((!u || !p) && req.method==='GET'){
+      u = u || req.query.username || req.query.user || req.query.email || req.query.login
+      p = p || req.query.password
+    }
+    return { username: String(u||''), password: String(p||'') }
+  }
+
+  async function getUser(username){
+    if (!db) return null
+    // sqlite-like
+    if (typeof db.get === 'function'){
+      try{ return await db.get('SELECT * FROM users WHERE username=?', [username]) }catch{}
+    }
+    // pg-like
+    if (typeof db.query === 'function'){
+      try{ const r = await db.query('SELECT * FROM users WHERE username=$1 LIMIT 1', [username]); return r?.rows?.[0]||r?.[0]||null }catch{}
+    }
+    return null
+  }
+
+  async function ensureAdmin(){
+    if (!db) return
+    const exists = await getUser(ADMIN_USER)
+    if (exists) return
+
+    let hash=null
+    if (bcrypt){ try{ hash = await bcrypt.hash(ADMIN_PASS, 10) }catch{} }
+
+    async function run(sql, params){
+      try{
+        if (typeof db.run==='function'){ await db.run(sql, params); return true }
+        if (typeof db.query==='function'){ await db.query(sql, params); return true }
+      }catch{}
+      return false
+    }
+
+    await run(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT,
+        password TEXT,
+        role TEXT DEFAULT 'user',
+        created_at TEXT
+      );`, [])
+
+    // sqlite UPSERT
+    const fields=['username','role','created_at','password']; const vals=[ADMIN_USER,'admin',new Date().toISOString(),ADMIN_PASS]
+    if (hash){ fields.push('password_hash'); vals.push(hash) }
+
+    const qSqlite = `INSERT INTO users (${fields.join(',')}) VALUES (${fields.map(()=>'?').join(',')})
+                     ON CONFLICT(username) DO UPDATE SET role='admin', password=excluded.password,
+                     password_hash=COALESCE(excluded.password_hash, users.password_hash)`
+    if (await run(qSqlite, vals)) return
+
+    // pg UPSERT
+    const places = vals.map((_,i)=>'$'+(i+1)).join(',')
+    const qPg = `INSERT INTO users (${fields.join(',')}) VALUES (${places})
+                 ON CONFLICT (username) DO UPDATE SET role='admin', password=EXCLUDED.password,
+                 password_hash=COALESCE(EXCLUDED.password_hash, users.password_hash)`
+    await run(qPg, vals)
+  }
+
+  async function verifyPassword(u, plain){
+    if (!u) return false
+    if (bcrypt && u.password_hash){ try{ if (await bcrypt.compare(plain, u.password_hash)) return true }catch{} }
+    if (u.password && String(u.password)===String(plain)) return true
+    return (u.username===ADMIN_USER && plain===ADMIN_PASS) // letzter Fallback
+  }
+
+  // Info-Endpunkt zum Debuggen
+  app.get?.('/api/login/ping', (_req,res)=> res.json({ok:true, route:'00-auth-login.js (function export)', expects:['username|user|email|login','password']}))
+
+  app.post('/api/login', async (req,res)=>{
+    try{
+      const { username, password } = pickCredentials(req)
+      if (!username || !password) return res.status(400).json({ error:'missing_credentials' })
+
+      // Bypass (ohne DB)
+      if (username===ADMIN_USER && password===ADMIN_PASS){
+        return res.json({ ok:true, user:{ username, role:'admin' }, token: mkToken() })
+      }
+
+      // DB-Check (wenn vorhanden)
+      let u = await getUser(username)
+      if (!u && username===ADMIN_USER && password===ADMIN_PASS){
+        await ensureAdmin(); u = await getUser(username)
+      }
+      if (!u) return res.status(401).json({ error:'invalid_user' })
+
+      const ok = await verifyPassword(u, password)
+      if (!ok) return res.status(401).json({ error:'wrong_password' })
+
+      return res.json({ ok:true, user:{ id:u.id, username:u.username, role:u.role||'user' }, token: mkToken() })
+    }catch(err){
+      console.error('LOGIN ERROR:', err)
+      res.status(500).json({ error:'server_error' })
+    }
+  })
+
+  console.log('[login] /api/login aktiv – ADMIN_USER=%s', ADMIN_USER)
+}

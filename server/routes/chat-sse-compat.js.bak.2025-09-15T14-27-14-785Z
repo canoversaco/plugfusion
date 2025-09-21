@@ -1,0 +1,92 @@
+const DB = require("../db");
+const subscribers = new Map(); // room -> Set(res)
+
+function roomSet(room) {
+  if (!subscribers.has(room)) subscribers.set(room, new Set());
+  return subscribers.get(room);
+}
+function broadcast(room, msg) {
+  const subs = roomSet(room);
+  const data = JSON.stringify({ type: "chat", data: msg });
+  for (const res of subs) {
+    try { res.write(`data: ${data}\n\n`); } catch { /* ignore */ }
+  }
+}
+async function q(sqlQ, params) {
+  // try SQLite style first
+  try { return await DB.query(sqlQ, params); } catch (e1) {
+    // replace ? with $1.. and try PG
+    const parts = sqlQ.split("?");
+    if (parts.length > 1) {
+      const pgSql = parts.reduce((acc, p, i) => acc + p + (i < parts.length-1 ? `$${i}` : ""), "");
+      try { return await DB.query(pgSql, params); } catch (e2) { throw e2; }
+    }
+    throw e1;
+  }
+}
+async function ensureTable() {
+  try {
+    await q("CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, user_id TEXT, author TEXT, text TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)", []);
+  } catch {
+    // Postgres
+    try {
+      await DB.query("CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, room TEXT, user_id TEXT, author TEXT, text TEXT, created_at TIMESTAMP DEFAULT NOW())", []);
+    } catch {}
+  }
+}
+
+module.exports = (app /*, db, mw */) => {
+  // SSE stream
+  app.get("/api/chat/stream", async (req, res) => {
+    const room = String(req.query.room || "");
+    if (!room) return res.status(400).json({ error: "room required" });
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders && res.flushHeaders();
+    res.write("retry: 2000\n\n");
+
+    roomSet(room).add(res);
+    req.on("close", () => { roomSet(room).delete(res); });
+
+    // initial hello
+    res.write(`data: ${JSON.stringify({ type: "hello", room })}\n\n`);
+  });
+
+  // history
+  app.get("/api/chat/history", async (req, res) => {
+    const room = String(req.query.room || "");
+    if (!room) return res.json({ messages: [] });
+    await ensureTable();
+    try {
+      const r = await q("SELECT id, room, user_id, author, text, created_at FROM chat_messages WHERE room = ? ORDER BY id ASC LIMIT 200", [room]);
+      const rows = r.rows || r || [];
+      res.json({ messages: rows });
+    } catch (e) {
+      res.json({ messages: [] });
+    }
+  });
+
+  // send
+  app.post("/api/chat/send", async (req, res) => {
+    const { room, text } = req.body || {};
+    if (!room || !text) return res.status(400).json({ error: "room and text required" });
+    const user = (req.user && (req.user.id || req.user.user_id)) || req.headers["x-user-id"] || null;
+    const author = (req.user && (req.user.name || req.user.username)) || "User";
+    await ensureTable();
+    try {
+      // SQLite insert
+      await q("INSERT INTO chat_messages (room, user_id, author, text) VALUES (?, ?, ?, ?)", [room, user, author, text]);
+    } catch {
+      try {
+        // PG insert
+        await DB.query("INSERT INTO chat_messages (room, user_id, author, text) VALUES ($1, $2, $3, $4)", [room, user, author, text]);
+      } catch (e) {
+        return res.status(400).json({ error: String(e.message || e) });
+      }
+    }
+    const msg = { room, user_id: user, author, text, created_at: new Date().toISOString() };
+    broadcast(room, msg);
+    res.json({ ok: true });
+  });
+};

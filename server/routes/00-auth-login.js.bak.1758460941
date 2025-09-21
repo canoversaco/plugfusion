@@ -1,0 +1,109 @@
+const express = require('express')
+const crypto = require('crypto')
+let bcrypt = null; try{ bcrypt = require('bcryptjs') }catch{}
+
+const ADMIN_USER = process.env.ADMIN_USER || 'admin'
+const ADMIN_PASS = process.env.ADMIN_PASS || 'Admin123!'
+
+function mkToken(){ return crypto.randomBytes(24).toString('hex') }
+
+function makeRouter(db){
+  const r = express.Router()
+  r.use(express.json({limit:'200kb'}))
+
+  async function getUser(username){
+    if (!db) return null
+    // sqlite-like
+    if (typeof db.get === 'function'){
+      try { return await db.get('SELECT * FROM users WHERE username=?', [username]) } catch(e){}
+    }
+    // pg-like
+    if (typeof db.query === 'function'){
+      try { const q=await db.query('SELECT * FROM users WHERE username=$1 LIMIT 1',[username]); return q?.rows?.[0]||q?.[0]||null } catch(e){}
+    }
+    return null
+  }
+
+  async function ensureAdmin(){
+    if (!db) return
+    const u = await getUser(ADMIN_USER)
+    if (u) return
+    let hash = null
+    if (bcrypt){ try{ hash = await bcrypt.hash(ADMIN_PASS, 10) }catch{} }
+    const fields=['username','role','created_at','password']; const vals=[ADMIN_USER,'admin',new Date().toISOString(),ADMIN_PASS]
+    if (hash){ fields.push('password_hash'); vals.push(hash) }
+
+    async function run(sql, params){
+      try{
+        if (typeof db.run==='function'){ await db.run(sql, params); return true }
+        if (typeof db.query==='function'){ await db.query(sql, params); return true }
+      }catch(e){}
+      return false
+    }
+    await run(`
+      CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT,
+        password TEXT,
+        role TEXT DEFAULT 'user',
+        created_at TEXT
+      )`, [])
+
+    // sqlite upsert
+    if (await run(
+      `INSERT INTO users (${fields.join(',')}) VALUES (${fields.map(()=>'?').join(',')})
+       ON CONFLICT(username) DO UPDATE SET role='admin', password=excluded.password,
+       password_hash=COALESCE(excluded.password_hash, users.password_hash)`, vals
+    )) return
+
+    // pg upsert
+    const pgPlace = vals.map((_,i)=>'$'+(i+1)).join(',')
+    await run(
+      `INSERT INTO users (${fields.join(',')}) VALUES (${pgPlace})
+       ON CONFLICT (username) DO UPDATE SET role='admin', password=EXCLUDED.password,
+       password_hash=COALESCE(EXCLUDED.password_hash, users.password_hash)`, vals
+    )
+  }
+
+  async function checkPass(u, plain){
+    if (!u) return false
+    if (bcrypt && u.password_hash){ try{ if (await bcrypt.compare(plain, u.password_hash)) return true }catch{} }
+    if (u.password && String(u.password)===String(plain)) return true
+    return false
+  }
+
+  r.post('/api/login', async (req,res)=>{
+    try{
+      const { username, password } = req.body || {}
+      // Bypass (ohne DB)
+      if (username===ADMIN_USER && password===ADMIN_PASS){
+        return res.json({ ok:true, user:{ username, role:'admin' }, token: mkToken() })
+      }
+      // DB prüfen (falls vorhanden)
+      const u = await getUser(username)
+      if (!u){
+        // Bootstrap Admin on-the-fly, wenn Admin-Login versucht wurde:
+        if (username===ADMIN_USER && password===ADMIN_PASS){
+          await ensureAdmin()
+        }
+      }
+      const user = u || await getUser(username)
+      if (!user) return res.status(401).json({ ok:false, error:'invalid_user' })
+      const ok = await checkPass(user, password)
+      if (!ok) return res.status(401).json({ ok:false, error:'wrong_password' })
+      return res.json({ ok:true, user:{ id:user.id, username:user.username, role:user.role||'user' }, token: mkToken() })
+    }catch(e){
+      console.error('LOGIN ERROR', e)
+      return res.status(500).json({ ok:false, error:'server_error' })
+    }
+  })
+
+  return r
+}
+
+// Export als Router UND mit init(), damit beide Ladestrategien funktionieren
+const router = makeRouter(global.__APP_DB || null)
+module.exports = router
+module.exports.default = router
+module.exports.init = (app, db)=> app.use(makeRouter(db||null))
